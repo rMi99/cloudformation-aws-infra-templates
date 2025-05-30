@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Create CloudFront distribution for <DOMAIN.COM> with ACM validation details'
+
+Parameters:
+  DomainName:
+    Description: 'The domain name to configure (e.g., <DOMAIN.COM>)'
+    Type: String
+    Default: '<DOMAIN.COM>'
+  S3BucketDomain:
+    Description: 'Existing S3 bucket domain name'
+    Type: String
+    Default: '<BUCKET_NAME>.s3.us-east-1.amazonaws.com'
+
+Resources:
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      SubjectAlternativeNames: []
+      Tags:
+        - Key: Name
+          Value: !Sub 'SSL Certificate for ${DomainName}'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: SSLCertificate
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'CloudFront distribution for ${DomainName}'
+        Origins:
+          - DomainName: !Ref S3BucketDomain
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        IPV6Enabled: true
+
+Outputs:
+  CloudFrontDomain:
+    Description: 'CloudFront distribution domain name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  CertificateStatus:
+    Description: 'Status of ACM certificate creation'
+    Value: !Ref SSLCertificate
+  CertificateValidationRecord:
+    Description: 'DNS validation record for ACM certificate'
+    Value: !Sub |
+      Add this CNAME record in Cloudflare to validate the SSL certificate:
+      Name:  { "Fn::GetAtt": [ "SSLCertificate", "DomainValidationOptions.0.ResourceRecord.Name" ] }
+      Value: { "Fn::GetAtt": [ "SSLCertificate", "DomainValidationOptions.0.ResourceRecord.Value" ] }
+      TTL: 300
+      Proxied: false
+  CloudflareConfiguration:
+    Description: 'Cloudflare DNS configuration for production'
+    Value: !Sub |
+      After certificate validation, create this CNAME record in Cloudflare:
+      Name: ${DomainName}
+      Value: { "Fn::GetAtt": [ "CloudFrontDistribution", "DomainName" ] }
+      TTL: 300
+      Proxied: false
