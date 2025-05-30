@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3-triggered video compression using AWS Elemental MediaConvert
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Name of the S3 bucket where videos are uploaded
+  DestinationBucketName:
+    Type: String
+    Description: Name of the S3 bucket for compressed videos
+  SourcePrefix:
+    Type: String
+    Default: 'path/to/upload/'
+    Description: S3 path prefix to trigger Lambda (e.g., 'uploads/videos/')
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: MediaConvertS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SourceBucketName}/${SourcePrefix}*'
+                  - !Sub 'arn:aws:s3:::${DestinationBucketName}/*'
+              - Effect: Allow
+                Action: 'mediaconvert:*'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunction}:*'
+
+  # Lambda Function
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: VideoCompressionHandler
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300  # 5 minutes (MediaConvert jobs can take time)
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              mediaconvert = boto3.client('mediaconvert', endpoint_url=os.environ['MEDIA_CONVERT_ENDPOINT'])
+
+              # Get uploaded file details
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              
+              # Generate output path
+              output_key = f"compressed/{os.path.basename(key)}"
+              report_key = f"reports/{os.path.basename(key)}_report.json"
+              
+              # MediaConvert Job Settings
+              job_settings = {
+                  "OutputGroups": [
+                      {
+                          "Name": "File Group",
+                          "Outputs": [
+                              {
+                                  "Preset": "System-Generic_Hd_Mp4_Avc_Aac_16x9_1920x1080p_24Hz_6Mbps",
+                                  "Extension": "mp4",
+                              }
+                          ],
+                          "OutputGroupSettings": {
+                              "Type": "FILE_GROUP_SETTINGS",
+                              "FileGroupSettings": {
+                                  "Destination": f"s3://{os.environ['DESTINATION_BUCKET']}/{output_key}"
+                              }
+                          }
+                      }
+                  ],
+                  "Inputs": [
+                      {
+                          "FileInput": f"s3://{bucket}/{key}"
+                      }
+                  ]
+              }
+
+              # Submit MediaConvert job
+              job = mediaconvert.create_job(Role=os.environ['MEDIA_CONVERT_ROLE'], Settings=job_settings)
+              
+              # Generate report
+              report = {
+                  "timestamp": str(datetime.now()),
+                  "source_file": f"s3://{bucket}/{key}",
+                  "destination_file": f"s3://{os.environ['DESTINATION_BUCKET']}/{output_key}",
+                  "media_convert_job_id": job['Job']['Id'],
+                  "status": "SUBMITTED"
+              }
+              
+              # Save report to S3
+              s3.put_object(
+                  Bucket=os.environ['DESTINATION_BUCKET'],
+                  Key=report_key,
+                  Body=json.dumps(report)
+              )
+              
+              return report
+
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationBucketName
+          MEDIA_CONVERT_ENDPOINT: !Sub 'https://${MediaConvertEndpoint}.mediaconvert.${AWS::Region}.amazonaws.com'
+          MEDIA_CONVERT_ROLE: !GetAtt MediaConvertRole.Arn
+
+  # S3 Event Trigger
+  S3Trigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${SourceBucketName}'
+
+  # S3 Bucket Notification
+  BucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:Put'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref SourcePrefix
+            Function: !GetAtt LambdaFunction.Arn
+
+  # IAM Role for MediaConvert
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'mediaconvert.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: MediaConvertS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SourceBucketName}/${SourcePrefix}*'
+                  - !Sub 'arn:aws:s3:::${DestinationBucketName}/*'
+
+  # MediaConvert Endpoint
+  MediaConvertEndpoint:
+    Type: AWS::MediaConvert::Endpoint
+    Properties:
+      Description: "MediaConvert Endpoint for Video Processing"
+
+Outputs:
+  LambdaFunctionName:
+    Description: "Name of the Lambda function"
+    Value: !Ref LambdaFunction
+  SourceBucket:
+    Description: "S3 bucket where videos are uploaded"
+    Value: !Ref SourceBucketName
+  DestinationBucket:
+    Description: "S3 bucket for compressed videos"
+    Value: !Ref DestinationBucketName
+  MediaConvertEndpointUrl:
+    Description: "MediaConvert Endpoint URL"
+    Value: !GetAtt MediaConvertEndpoint.Arn
