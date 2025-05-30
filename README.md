@@ -1,4 +1,4 @@
-````markdown
+
 # AWS Infrastructure with CloudFormation
 
 Modular and reusable CloudFormation templates for:
